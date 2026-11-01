@@ -1,0 +1,22 @@
+
+# Environnement virtuel Python
+.venv/
+venv/
+
+# Fichiers temporaires Python
+__pycache__/
+*.pyc
+
+# Configuration PyCharm
+.idea/
+
+# Base de données locale SQLite
+instance/
+*.db
+*.sqlite
+*.sqlite3
+
+# Informations confidentielles
+.env
+.env.*
+!.env.example
