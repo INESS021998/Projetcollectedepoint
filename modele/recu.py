@@ -16,11 +16,11 @@ class User(db.Model):
 
 class Recu(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    photo = db.Column(db.String(255), nullable=False)
     montant = db.Column(db.Numeric(10, 2), nullable=False)
     date_recu = db.Column(db.DateTime, nullable=False)
     magasin = db.Column(db.String(150), nullable=False)
     points = db.Column(db.Integer, nullable=False)
+    photo = db.Column(db.String(255))
     user_id = db.Column(
         db.Integer,
         db.ForeignKey(User.__table__.c.id),
