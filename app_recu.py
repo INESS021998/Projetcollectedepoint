@@ -13,6 +13,7 @@ from flask import request, jsonify
 
 from schema import recu_schema
 from settings import app, db
+from faker__genphoto import generer_recus_fictifs_si_absents
 
 # Initialisation de Swagger
 
@@ -166,6 +167,7 @@ users =  {
 # Créer les comptes de démonstration
 with app.app_context():
     db.create_all()
+    generer_recus_fictifs_si_absents()
     for username, password in users.items():
         utilisateur = db.session.execute(
             db.select(User).where(User.username == username)
