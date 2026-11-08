@@ -26,7 +26,10 @@ class Recu(db.Model):
         db.ForeignKey(User.__table__.c.id),
         nullable=False
     )
-class Echange(db.Model):
+class EchangeMagasin(db.Model):
+    # La table existante conserve l’historique des échanges en magasin.
+    __tablename__ = "echange"
+
     id = db.Column(db.Integer, primary_key=True)
 
     user_id = db.Column(
@@ -36,6 +39,8 @@ class Echange(db.Model):
     )
     points_utilises = db.Column(db.Integer, nullable=False)
     date_echange = db.Column(db.DateTime, nullable=False)
+    # Nullable to preserve existing exchange history.
+    magasin = db.Column(db.String(150), nullable=True)
     
 if __name__ == "__main__":
     with app.app_context():
