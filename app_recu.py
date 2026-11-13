@@ -4,9 +4,9 @@ import requests
 import re
 from pathlib import Path
 from uuid import uuid4
-from flasgger import Flasgger, Swagger
+from flasgger import Swagger
 from marshmallow import ValidationError
-from modele.recu import Recu, User,Echange
+from modele.recu import Recu, User, EchangeMagasin
 from datetime import datetime, timezone, timedelta
 from werkzeug.security import generate_password_hash
 from flask import request, jsonify
@@ -14,13 +14,18 @@ from flask import request, jsonify
 from schema import recu_schema
 from settings import app, db
 
-# Initialisation de Swagger
+POINTS_PAR_ECHANGE_MAGASIN = 15000
+POINTS_PAR_DOLLAR_CAD = 1000
+REDUCTION_ECHANGE_CAD  = 15.0
+JWT_EXPIRATION_HOURS = 2
 
+
+# Initialisation de Swagger
 swagger = Swagger(app, template={
     "swagger": "2.0",
     "info": {
         "title": "ProjetCollectedePoint",
-        "version": "1.0",
+        "version": "2.2.0",
         "description": "API REST de gestion des reçus et points"
     },
     "securityDefinitions": {
@@ -30,8 +35,28 @@ swagger = Swagger(app, template={
             "in": "header",
             "description": "Saisir Bearer suivi du jeton JWT"
         }
+    },
+    "definitions": {
+        "Recu": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "example": 1},
+                "magasin": {"type": "string", "example": "IGA"},
+                "montant": {"type": "number", "example": 45.78},
+                "date_recu": {
+                    "type": "string",
+                    "format": "date",
+                    "example": "2026-11-13"
+                },
+                "photo": {"type": "string", "example": "recu_iga.png"},
+                "points": {"type": "integer", "example": 90},
+                "user_id": {"type": "integer", "example": 1}
+            }
+        }
     }
 })
+
+
 
 def extraire_informations(texte):
     lignes = [
@@ -181,7 +206,7 @@ with app.app_context():
 # ==================================================
 # CONNEXION
 # ==================================================
-@app.route('/api/recu/login', methods=['POST'])
+@app.route('/api/recu/n', methods=['POST'])
 def login():
 
     """
@@ -195,6 +220,9 @@ def login():
         required: true
         schema:
           type: object
+          required:
+            - username
+            - password
           properties:
             username:
               type: string
@@ -202,9 +230,7 @@ def login():
             password:
               type: string
               format: password
-          required:
-            - username
-            - password
+              example: admin1234
     responses:
       200:
         description: Connexion réussie, jeton JWT retourné
@@ -369,8 +395,9 @@ def get_all_recu():
         })
     return jsonify({'recus': listing_recu}), 200
 
+#========================
 #creation du recu
-
+#============================
 @app.route('/api/recu', methods=['POST'])
 @token_required
 def creer_recu():
@@ -398,7 +425,7 @@ def creer_recu():
           properties:
             magasin:
               type: string
-              example: Soucy-Chouinard
+              example: "Soucy-Chouinard"
             date_recu:
               type: string
               format: date
@@ -409,7 +436,7 @@ def creer_recu():
               example: 17.88
             photo:
               type: string
-              example: c0908158b0314e33b96fe164278bd694.png
+              example: "c0908158b0314e33b96fe164278bd694.png"
     responses:
       201:
         description: Reçu enregistré et points attribués
@@ -481,132 +508,235 @@ def creer_recu():
         'monnaie': 'CAD'
     }), 201
 
-# consulter les points
-@app.route('/api/recus/points', methods=['GET'])
-@token_required
-def consulter_points():
+def obtenir_magasins_eligibles_pour_echange():
+    """Liste distincte des magasins figurant sur les reçus enregistrés."""
+    noms = db.session.execute(
+        db.select(Recu.magasin)
+        .where(Recu.magasin.is_not(None), Recu.magasin != "")
+        .distinct()
+    ).scalars().all()
+    uniques = {}
+    for nom in noms:
+        if isinstance(nom, str) and nom.strip():
+            uniques.setdefault(nom.strip().casefold(), nom.strip())
+    return sorted(uniques.values(), key=str.casefold)
 
+def obtenir_resume_conversion_points(user_id):
+    # Calculer les points accumulés
+    points_accumules = db.session.execute(
+        db.select(db.func.coalesce(db.func.sum(Recu.points), 0))
+        .where(Recu.user_id == user_id)
+    ).scalar_one()
+
+    # Calculer les points déjà utilisés
+    total_utilise = db.session.execute(
+        db.select(db.func.coalesce(db.func.sum(EchangeMagasin.points_utilises), 0))
+        .where(EchangeMagasin.user_id == user_id)
+    ).scalar_one()
+
+    points_accumules = int(points_accumules)
+    total_utilise = int(total_utilise)
+    solde = points_accumules - total_utilise
+
+    return {
+        "user_id": user_id,
+        #"points_accumules": points_accumules,
+        "points_utilises": total_utilise,
+        "solde": solde,
+        #"valeur_points_accumules_cad": round(
+           # points_accumules / POINTS_PAR_DOLLAR_CAD, 2
+        #),
+        "valeur_solde_cad": round(
+            solde / POINTS_PAR_DOLLAR_CAD, 2
+        ),
+        #"points_requis_pour_echange_en_magasin": POINTS_PAR_ECHANGE_MAGASIN,
+        #"points_restants_pour_echange_en_magasin": max(
+           # 0, POINTS_PAR_ECHANGE_MAGASIN - solde
+       # ),
+        #"credit_obtenu_si_echange_en_magasin_cad": REDUCTION_ECHANGE_CAD,
+        "echange_en_magasin_autorise": solde >= POINTS_PAR_ECHANGE_MAGASIN
+    }
+
+def obtenir_magasins_eligibles_pour_echange(user_id):
+    magasins = db.session.execute(
+        db.select(Recu.magasin)
+        .where(Recu.user_id == user_id)
+        .distinct()
+        .order_by(Recu.magasin)
+    ).scalars().all()
+
+    return magasins
+
+#==============================
+#different magasin
+#================================
+@app.route('/api/magasins', methods=['GET'])
+@token_required
+def lister_magasins():
     """
-    Consulter le solde des points
+    Lister les magasins présents sur les factures du client connecté
+    et consulter son solde de points.
     ---
     tags:
-      - Points
+      - LISTE DES MAGASINS
     security:
       - Bearer: []
+    produces:
+      - application/json
     responses:
       200:
-        description: Solde des points de l'utilisateur connecté
+        description: Magasins admissibles et résumé des points du client.
         schema:
           type: object
           properties:
-            user_id:
-              type: integer
-            points_accumules:
-              type: integer
-            points_utilises:
-              type: integer
-            solde:
-              type: integer
-            objectif:
-              type: integer
-              example: 15000
-            points_restants:
-              type: integer
-            echange_autorise:
-              type: boolean
+            magasins_eligibles_pour_echange:
+              type: array
+              items:
+                type: string
+              example:
+                - IGA
+                - Metro
+            points_client:
+              type: object
+              properties:
+                user_id:
+                  type: integer
+                  example: 2
+                points_utilises:
+                  type: integer
+                  example: 0
+                solde:
+                  type: integer
+                  example: 18000
+                valeur_solde_cad:
+                  type: number
+                  example: 18.0
+                echange_en_magasin_autorise:
+                  type: boolean
+                  description: Indique si le solde de points est suffisant.
+                  example: true
+            devise:
+              type: string
+              example: CAD
       401:
-        description: Jeton JWT manquant ou invalide
+        description: JWT absent, invalide ou expiré.
     """
+
+    # Identifier le client connecté
     try:
         user_id = int(request.current_user)
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return jsonify({
-            'message': 'Identifiant du token invalide.'
+            "message": "Identifiant du token invalide."
         }), 401
 
+    # Vérifier si le client existe
     utilisateur = db.session.get(User, user_id)
 
     if utilisateur is None:
         return jsonify({
-            'message': 'Utilisateur introuvable.'
+            "message": "Utilisateur introuvable."
         }), 401
 
-    # Points gagnés grâce aux reçus
-    points_gagnes = db.session.execute(
-        db.select(
-            db.func.coalesce(db.func.sum(Recu.points), 0)
-        ).where(Recu.user_id == user_id)
-    ).scalar_one()
+    # Récupérer les magasins présents sur ses factures
+    magasins = obtenir_magasins_eligibles_pour_echange(user_id)
 
-    # Points déjà dépensés dans les échanges
-    points_utilises = db.session.execute(
-        db.select(
-            db.func.coalesce(db.func.sum(Echange.points_utilises), 0)
-        ).where(Echange.user_id == user_id)
-    ).scalar_one()
-
-    solde = int(points_gagnes - points_utilises)
-    objectif = 15000
+    # Calculer le résumé des points
+    points_client = obtenir_resume_conversion_points(user_id)
 
     return jsonify({
-        'user_id': user_id,
-        'points_accumules': int(points_gagnes),
-        'points_utilises': int(points_utilises),
-        'solde': solde,
-        'objectif': objectif,
-        'points_restants': max(0, objectif - solde),
-        'echange_autorise': solde >= objectif
+        "magasins_eligibles_pour_echange": magasins,
+        "points_client": points_client,
+        "devise": "CAD"
     }), 200
 
-
+#====================================
 # Échanger 15 000 points
+#================================
 @app.route('/api/echanges/points', methods=['POST'])
 @token_required
 def echanger_points():
-
     """
-    Échanger 15 000 points
-    ---
-    tags:
-      - Echanges
-    security:
-      - Bearer: []
-    responses:
-      201:
-        description: Échange effectué avec succès
-        schema:
-          type: object
-          properties:
-            message:
-              type: string
-              example: Échange effectué avec succès.
-            echange_id:
-              type: integer
-            points_utilises:
-              type: integer
-              example: 15000
-            nouveau_solde:
-              type: integer
-      401:
-        description: Jeton JWT manquant ou invalide
-      422:
-        description: Points insuffisants pour effectuer l'échange
-        schema:
-          type: object
-          properties:
-            message:
-              type: string
-              example: Points insuffisants.
-            solde:
-              type: integer
-            points_manquants:
-              type: integer
-    """
+       Échanger 15 000 points contre une réduction de 15 CAD
+       ---
+       tags:
+         - Echanges
+       security:
+         - Bearer: []
+       consumes:
+         - application/json
+       produces:
+         - application/json
+       parameters:
+         - in: body
+           name: body
+           required: true
+           schema:
+             type: object
+             required:
+               - magasin
+               - prix_produit
+             properties:
+               magasin:
+                 type: string
+                 example: IGA
+               prix_produit:
+                 type: number
+                 example: 25.00
+       responses:
+         201:
+           description: Échange effectué avec succès
+           schema:
+             type: object
+             properties:
+               message:
+                 type: string
+                 example: Échange effectué avec succès.
+               echange_id:
+                 type: integer
+                 example: 1
+               magasin:
+                 type: string
+                 example: IGA
+               points_utilises:
+                 type: integer
+                 example: 15000
+               reduction_cad:
+                 type: number
+                 example: 15.0
+               prix_produit:
+                 type: number
+                 example: 25.0
+               montant_a_payer:
+                 type: number
+                 example: 10.0
+               nouveau_solde:
+                 type: integer
+                 example: 3000
+         400:
+           description: Données invalides
+         401:
+           description: Jeton JWT absent, invalide ou expiré
+         422:
+           description: Points insuffisants, magasin non admissible ou prix inférieur à 15 CAD
+       """
 
     user_id = int(request.current_user)
     utilisateur = db.session.get(User, user_id)
     if utilisateur is None:
         return jsonify({'erreur': 'Utilisateur introuvable.'}), 401
+
+    donnees = request.get_json(silent=True)
+    if not isinstance(donnees, dict) or not isinstance(donnees.get("magasin"), str):
+        return jsonify({"message": "Envoyez un nom de magasin dans le champ magasin."}), 400
+    magasin_demande = donnees["magasin"].strip()
+    magasins = obtenir_magasins_eligibles_pour_echange(user_id)
+    magasin = next((nom for nom in magasins if nom.casefold() == magasin_demande.casefold()), None)
+    if magasin is None:
+        return jsonify({
+            "message": "Choisissez un magasin dans la liste disponible.",
+            "magasins_disponibles": magasins
+        }), 400
 
     # Calculer les points gagnés
     points_gagnes = db.session.execute(
@@ -616,30 +746,34 @@ def echanger_points():
     ).scalar_one()
     # Calculer les points déjà utilisés
     points_utilises = db.session.execute(
-        db.select(db.func.coalesce(db.func.sum(Echange.points_utilises), 0))
-        .where(Echange.user_id == user_id)
+        db.select(db.func.coalesce(db.func.sum(EchangeMagasin.points_utilises), 0))
+        .where(EchangeMagasin.user_id == user_id)
     ).scalar_one()
     solde = int(points_gagnes - points_utilises)
-    if solde < 15000:
+    if solde < POINTS_PAR_ECHANGE_MAGASIN:
         return jsonify({
             'message': 'Points insuffisants.',
             'solde': solde,
-            'points_manquants': 15000 - solde
+            'points_manquants': POINTS_PAR_ECHANGE_MAGASIN - solde
         }), 422
 
     # Enregistrer l'échange
-    echange = Echange(
+    echange = EchangeMagasin(
         user_id=user_id,
-        points_utilises=15000,
-        date_echange=datetime.now(timezone.utc)
+        points_utilises=POINTS_PAR_ECHANGE_MAGASIN,
+        date_echange=datetime.now(timezone.utc),
+        magasin = magasin
     )
     db.session.add(echange)
     db.session.commit()
     return jsonify({
         'message': 'Échange effectué avec succès.',
         'echange_id': echange.id,
-        'points_utilises': 15000,
-        'nouveau_solde': solde - 15000
+        'points_utilises': POINTS_PAR_ECHANGE_MAGASIN,
+        'nouveau_solde': solde - POINTS_PAR_ECHANGE_MAGASIN,
+        "magasin": magasin,
+        "devise": "CAD"
+
     }), 201
 
 @app.route('/api/historique', methods=['GET'])
@@ -690,9 +824,9 @@ def consulter_historique():
         }), 401
     # Récupérer uniquement les échanges de cet utilisateur
     echanges = db.session.execute(
-        db.select(Echange)
-        .where(Echange.user_id == user_id)
-        .order_by(Echange.date_echange.desc(), Echange.id.desc())
+        db.select(EchangeMagasin)
+        .where(EchangeMagasin.user_id == user_id)
+        .order_by(EchangeMagasin.date_echange.desc(), EchangeMagasin.id.desc())
     ).scalars().all()
     # Préparer la liste à retourner
     historique = []
@@ -700,7 +834,8 @@ def consulter_historique():
         historique.append({
             'echange_id': echange.id,
             'points_utilises': echange.points_utilises,
-            'date_echange': echange.date_echange.isoformat()
+            'date_echange': echange.date_echange.isoformat(),
+            'magasin': echange.magasin
         })
     return jsonify({
         'user_id': user_id,

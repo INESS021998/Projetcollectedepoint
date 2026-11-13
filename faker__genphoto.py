@@ -21,8 +21,8 @@ try:
 except OSError:
     police = ImageFont.load_default()
 
-    #generer 5 recus
-for numero in range(1,6):
+    #generer 10 recus
+for numero in range(1,9):
     magasin = fake.company()
     date_recu =fake.date_between(
         start_date="-30d",
