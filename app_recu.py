@@ -2,6 +2,7 @@ import functools
 import jwt
 import requests
 import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from uuid import uuid4
 from flasgger import Swagger
@@ -657,94 +658,130 @@ def lister_magasins():
 @token_required
 def echanger_points():
     """
-       Échanger 15 000 points contre une réduction de 15 CAD
-       ---
-       tags:
-         - Echanges
-       security:
-         - Bearer: []
-       consumes:
-         - application/json
-       produces:
-         - application/json
-       parameters:
-         - in: body
-           name: body
-           required: true
-           schema:
-             type: object
-             required:
-               - magasin
-               - prix_produit
-             properties:
-               magasin:
-                 type: string
-                 example: IGA
-               prix_produit:
-                 type: number
-                 example: 25.00
-       responses:
-         201:
-           description: Échange effectué avec succès
-           schema:
-             type: object
-             properties:
-               message:
-                 type: string
-                 example: Échange effectué avec succès.
-               echange_id:
-                 type: integer
-                 example: 1
-               magasin:
-                 type: string
-                 example: IGA
-               points_utilises:
-                 type: integer
-                 example: 15000
-               reduction_cad:
-                 type: number
-                 example: 15.0
-               prix_produit:
-                 type: number
-                 example: 25.0
-               montant_a_payer:
-                 type: number
-                 example: 10.0
-               nouveau_solde:
-                 type: integer
-                 example: 3000
-         400:
-           description: Données invalides
-         401:
-           description: Jeton JWT absent, invalide ou expiré
-         422:
-           description: Points insuffisants, magasin non admissible ou prix inférieur à 15 CAD
-       """
-
+    Échanger 15 000 points contre une réduction de 15 CAD.
+    Le prix du produit doit être d'au moins 15 CAD.
+    ---
+    tags:
+      - Echanges
+    security:
+      - Bearer: []
+    consumes:
+      - application/json
+    produces:
+      - application/json
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - magasin
+            - prix_produit
+          properties:
+            magasin:
+              type: string
+              description: Magasin où le produit est acheté.
+              example: IGA
+            prix_produit:
+              type: number
+              format: double
+              description: Prix du produit en CAD; minimum 15.00.
+              example: 15.00
+    responses:
+      201:
+        description: Échange effectué avec succès
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Échange effectué avec succès.
+            echange_id:
+              type: integer
+              example: 1
+            magasin:
+              type: string
+              example: IGA
+            points_utilises:
+              type: integer
+              example: 15000
+            reduction_cad:
+              type: number
+              example: 15.0
+            prix_produit:
+              type: number
+              example: 15.0
+            montant_a_payer:
+              type: number
+              example: 0.0
+            nouveau_solde:
+              type: integer
+              example: 3000
+            devise:
+              type: string
+              example: CAD
+      400:
+        description: Magasin ou prix invalide
+      401:
+        description: Jeton JWT absent, invalide ou expiré
+      422:
+        description: Solde insuffisant ou prix inférieur à 15 CAD
+    """
     user_id = int(request.current_user)
     utilisateur = db.session.get(User, user_id)
     if utilisateur is None:
-        return jsonify({'erreur': 'Utilisateur introuvable.'}), 401
+        return jsonify({"erreur": "Utilisateur introuvable."}), 401
 
     donnees = request.get_json(silent=True)
-    if not isinstance(donnees, dict) or not isinstance(donnees.get("magasin"), str):
-        return jsonify({"message": "Envoyez un nom de magasin dans le champ magasin."}), 400
-    magasin_demande = donnees["magasin"].strip()
-    magasins = obtenir_magasins_eligibles_pour_echange(user_id)
-    magasin = next((nom for nom in magasins if nom.casefold() == magasin_demande.casefold()), None)
-    if magasin is None:
+    if not isinstance(donnees, dict):
         return jsonify({
-            "message": "Choisissez un magasin dans la liste disponible.",
-            "magasins_disponibles": magasins
+            "message": "Envoyez un objet JSON avec magasin et prix_produit."
         }), 400
 
-    # Calculer les points gagnés
+    magasin = donnees.get("magasin")
+    if not isinstance(magasin, str) or not magasin.strip():
+        return jsonify({
+            "message": "Le champ magasin doit contenir un nom non vide."
+        }), 400
+    magasin = magasin.strip()
+    if len(magasin) > 150:
+        return jsonify({
+            "message": "Le nom du magasin ne peut pas dépasser 150 caractères."
+        }), 400
+
+    prix_brut = donnees.get("prix_produit")
+    if isinstance(prix_brut, bool) or not isinstance(prix_brut, (int, float)):
+        return jsonify({
+            "message": "Le champ prix_produit doit être un nombre en CAD."
+        }), 400
+    try:
+        prix_produit = Decimal(str(prix_brut))
+        if not prix_produit.is_finite():
+            raise InvalidOperation
+        prix_arrondi = prix_produit.quantize(Decimal("0.01"))
+    except InvalidOperation:
+        return jsonify({
+            "message": "Le prix doit être un nombre valide avec au plus deux décimales."
+        }), 400
+    if prix_arrondi != prix_produit:
+        return jsonify({
+            "message": "Le prix doit avoir au plus deux décimales."
+        }), 400
+    prix_produit = prix_arrondi
+
+    reduction_cad = Decimal(str(REDUCTION_ECHANGE_CAD)).quantize(Decimal("0.01"))
+    if prix_produit < reduction_cad:
+        return jsonify({
+            "message": "Le produit doit coûter au moins 15,00 CAD pour cet échange.",
+            "prix_minimum_cad": float(reduction_cad),
+            "reduction_cad": float(reduction_cad)
+        }), 422
+
     points_gagnes = db.session.execute(
         db.select(db.func.coalesce(db.func.sum(Recu.points), 0))
         .where(Recu.user_id == user_id)
-
     ).scalar_one()
-    # Calculer les points déjà utilisés
     points_utilises = db.session.execute(
         db.select(db.func.coalesce(db.func.sum(EchangeMagasin.points_utilises), 0))
         .where(EchangeMagasin.user_id == user_id)
@@ -752,28 +789,31 @@ def echanger_points():
     solde = int(points_gagnes - points_utilises)
     if solde < POINTS_PAR_ECHANGE_MAGASIN:
         return jsonify({
-            'message': 'Points insuffisants.',
-            'solde': solde,
-            'points_manquants': POINTS_PAR_ECHANGE_MAGASIN - solde
+            "message": "Points insuffisants.",
+            "solde": solde,
+            "points_manquants": POINTS_PAR_ECHANGE_MAGASIN - solde
         }), 422
 
-    # Enregistrer l'échange
     echange = EchangeMagasin(
         user_id=user_id,
         points_utilises=POINTS_PAR_ECHANGE_MAGASIN,
         date_echange=datetime.now(timezone.utc),
-        magasin = magasin
+        magasin=magasin
     )
     db.session.add(echange)
     db.session.commit()
-    return jsonify({
-        'message': 'Échange effectué avec succès.',
-        'echange_id': echange.id,
-        'points_utilises': POINTS_PAR_ECHANGE_MAGASIN,
-        'nouveau_solde': solde - POINTS_PAR_ECHANGE_MAGASIN,
-        "magasin": magasin,
-        "devise": "CAD"
 
+    montant_a_payer = (prix_produit - reduction_cad).quantize(Decimal("0.01"))
+    return jsonify({
+        "message": "Échange effectué avec succès.",
+        "echange_id": echange.id,
+        "magasin": magasin,
+        "points_utilises": POINTS_PAR_ECHANGE_MAGASIN,
+        "reduction_cad": float(reduction_cad),
+        "prix_produit": float(prix_produit),
+        "montant_a_payer": float(montant_a_payer),
+        "nouveau_solde": solde - POINTS_PAR_ECHANGE_MAGASIN,
+        "devise": "CAD"
     }), 201
 
 @app.route('/api/historique', methods=['GET'])
